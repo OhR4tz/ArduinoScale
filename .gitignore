@@ -1,0 +1,6 @@
+﻿# Local dependencies and generated build files
+/.tools/
+
+# Operating system metadata
+.DS_Store
+Thumbs.db
