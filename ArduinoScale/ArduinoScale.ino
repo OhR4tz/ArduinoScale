@@ -11,9 +11,21 @@ const unsigned long USB_BAUD = 9600;
 const unsigned long BLUETOOTH_BAUD = 9600;
 const float CALIBRATION_MASS_G = 100.0f;
 const byte CAPTURE_SAMPLES = 20;
-const byte WEIGHT_SAMPLES = 5;
+const byte WEIGHT_SAMPLES = 2;
 const unsigned long SENSOR_TIMEOUT_MS = 2000;
 const unsigned long CAPTURE_TIMEOUT_MS = 10000;
+// Let the HX711 settle after power-up before the automatic startup tare.
+const unsigned long STARTUP_TARE_DELAY_MS = 1000;
+
+// Event-based weighing: one weight_g line per item placed on an empty platform.
+// Each averaged reading takes about 0.2 s (2 samples at the HX711's 10 SPS), so the
+// stable window below spans about 0.8 s. Short readings let a wobble cost only 0.2 s.
+const float EMPTY_THRESHOLD_G = 2.0f;          // |weight| below this counts as empty.
+const float LOAD_THRESHOLD_G = 5.0f;           // Weight at or above this counts as an item.
+const float STABLE_TOLERANCE_G = 1.0f;         // Allowed spread across the stable window...
+const float STABLE_TOLERANCE_FRACTION = 0.005f; // ...or 0.5% of the weight, whichever is larger.
+const byte STABLE_READINGS = 4;                // Consecutive agreeing readings before sending.
+const byte EMPTY_READINGS = 2;                 // Consecutive empty readings before re-arming.
 
 HX711 scale;
 SoftwareSerial bluetooth(8, 9); // Arduino RX, TX
@@ -30,10 +42,26 @@ long sampleSum = 0;
 byte sampleCount = 0;
 unsigned long captureStarted = 0;
 unsigned long lastReading = 0;
-unsigned long lastWeightSent = 0;
-char command[20];
-byte commandLength = 0;
-bool commandOverflow = false;
+
+// NOT_READY: needs calibration and tare. EMPTY: armed, waiting for an item.
+// SETTLING: item detected, waiting for a stable weight. WEIGHED: sent; waiting for removal.
+enum PlatformState { NOT_READY, EMPTY, SETTLING, WEIGHED };
+PlatformState platformState = NOT_READY;
+float stableSum = 0.0f;
+float stableMin = 0.0f;
+float stableMax = 0.0f;
+byte stableCount = 0;
+byte emptyCount = 0;
+bool startupTarePending = true;
+
+// USB and Bluetooth each get their own buffer so bytes from the two never mix.
+struct CommandBuffer {
+  char text[20];
+  byte length;
+  bool overflow;
+};
+CommandBuffer usbCommand = {};
+CommandBuffer bluetoothCommand = {};
 
 // EEPROM bytes 0..7: committed marker, format version, 4-byte factor, CRC16.
 // Only calibration is persistent: the empty-platform zero must be set each boot.
@@ -103,10 +131,79 @@ void resetSamples() {
 }
 
 void showHelp() {
-  status(F("# Commands over USB (send newline): tare | calibrate | help"));
-  status(F("# Empty platform and send tare after every reset."));
+  status(F("# Commands over USB or Bluetooth (send newline): tare | calibrate | help"));
+  status(F("# The scale tares itself at startup: power on with the platform empty."));
+  status(F("# One weight_g reading is sent per item once its weight is stable."));
   status(F("# First use or recalibration: tare, add 100 g, then send calibrate."));
   status(F("# Successful calibration is saved in EEPROM. Bluetooth UART: 9600 baud."));
+}
+
+void startStableWindow(float grams) {
+  stableSum = grams;
+  stableMin = grams;
+  stableMax = grams;
+  stableCount = 1;
+}
+
+void cancelSettling() {
+  if (platformState == SETTLING) {
+    platformState = EMPTY; // An item still on the platform is re-detected afterwards.
+  }
+}
+
+void processWeight(float grams) {
+  switch (platformState) {
+    case EMPTY:
+      if (grams >= LOAD_THRESHOLD_G) {
+        platformState = SETTLING;
+        startStableWindow(grams);
+        status(F("# Item detected; waiting for stable weight..."));
+      }
+      break;
+
+    case SETTLING: {
+      if (grams < LOAD_THRESHOLD_G) {
+        platformState = EMPTY; // Removed (or too light) before it settled.
+        break;
+      }
+      const float low = min(stableMin, grams);
+      const float high = max(stableMax, grams);
+      const float mean = (stableSum + grams) / (stableCount + 1);
+      const float tolerance = max(STABLE_TOLERANCE_G, STABLE_TOLERANCE_FRACTION * fabsf(mean));
+      if (high - low > tolerance) {
+        startStableWindow(grams); // Still moving: restart from the latest reading.
+        break;
+      }
+      stableSum += grams;
+      stableMin = low;
+      stableMax = high;
+      ++stableCount;
+      if (stableCount >= STABLE_READINGS) {
+        const float stableGrams = stableSum / stableCount;
+        Serial.print(F("weight_g,"));
+        Serial.println(stableGrams, 2);
+        bluetooth.print(F("weight_g,"));
+        bluetooth.println(stableGrams, 2);
+        platformState = WEIGHED;
+        emptyCount = 0;
+      }
+      break;
+    }
+
+    case WEIGHED:
+      if (fabsf(grams) < EMPTY_THRESHOLD_G) {
+        if (++emptyCount >= EMPTY_READINGS) {
+          platformState = EMPTY;
+          status(F("# Platform empty; ready for next item."));
+        }
+      } else {
+        emptyCount = 0;
+      }
+      break;
+
+    case NOT_READY:
+      break;
+  }
 }
 
 void beginCapture(CaptureMode mode) {
@@ -120,11 +217,12 @@ void beginCapture(CaptureMode mode) {
   }
 }
 
-void handleCommand() {
-  command[commandLength] = '\0';
-  if (commandOverflow) {
+void handleCommand(CommandBuffer &buffer) {
+  buffer.text[buffer.length] = '\0';
+  const char *command = buffer.text;
+  if (buffer.overflow) {
     status(F("# ERROR: command too long. Send help."));
-  } else if (commandLength == 0) {
+  } else if (buffer.length == 0) {
     return; // Ignore the LF after a CR and empty lines.
   } else if (strcmp(command, "help") == 0 || strcmp(command, "h") == 0) {
     showHelp();
@@ -143,18 +241,20 @@ void handleCommand() {
   }
 }
 
-void readCommands() {
-  while (Serial.available() > 0) {
-    const char incoming = (char)Serial.read();
+// Bluetooth note: HX711 reads briefly block interrupts, which can corrupt a SoftwareSerial
+// byte that arrives at that moment. A garbled command gets an ERROR reply; just resend it.
+void readCommands(Stream &port, CommandBuffer &buffer) {
+  while (port.available() > 0) {
+    const char incoming = (char)port.read();
     if (incoming == '\r' || incoming == '\n') {
-      handleCommand();
-      commandLength = 0;
-      commandOverflow = false;
-    } else if (!commandOverflow) {
-      if (commandLength < sizeof(command) - 1) {
-        command[commandLength++] = incoming;
+      handleCommand(buffer);
+      buffer.length = 0;
+      buffer.overflow = false;
+    } else if (!buffer.overflow) {
+      if (buffer.length < sizeof(buffer.text) - 1) {
+        buffer.text[buffer.length++] = incoming;
       } else {
-        commandOverflow = true;
+        buffer.overflow = true;
       }
     }
   }
@@ -164,6 +264,7 @@ void finishCapture(long average) {
   if (captureMode == TARE) {
     zeroOffset = average;
     hasTare = true;
+    platformState = EMPTY;
     if (calibrated) {
       status(F("# Tare complete. Ready to weigh using the current calibration."));
     } else {
@@ -178,6 +279,8 @@ void finishCapture(long average) {
     } else {
       countsPerGram = (float)delta / CALIBRATION_MASS_G;
       calibrated = true;
+      platformState = WEIGHED; // Don't report the 100 g weight; wait for its removal.
+      emptyCount = 0;
       status(F("# Calibration complete. Remove 100 g; weight_g readings are in grams."));
       if (saveCalibration(countsPerGram)) {
         status(F("# Calibration saved. After reset, only tare the empty platform."));
@@ -198,20 +301,30 @@ void setup() {
   status(F("# ArduinoScale ready. USB: 9600 baud."));
   calibrated = loadCalibration(countsPerGram);
   if (calibrated) {
-    status(F("# Saved calibration loaded. Empty platform and send tare to start weighing."));
+    status(F("# Saved calibration loaded. Taring the empty platform at startup."));
   } else {
-    status(F("# No valid saved calibration. Tare, add 100 g, then send calibrate."));
+    status(F("# No valid saved calibration. After the startup tare, add 100 g and send calibrate."));
   }
   showHelp();
 }
 
 void loop() {
-  readCommands();
+  readCommands(Serial, usbCommand);
+  readCommands(bluetooth, bluetoothCommand);
   unsigned long now = millis();
   if (captureMode != IDLE && now - captureStarted >= CAPTURE_TIMEOUT_MS) {
     captureMode = IDLE;
     resetSamples();
     status(F("# ERROR: capture timed out; previous tare/calibration retained. Retry command."));
+  }
+  // Startup tare, so the scale works with no laptop attached. A manual tare cancels it.
+  // Runs after the timeout check: beginCapture() stamps a start time later than `now`.
+  if (startupTarePending && (hasTare || captureMode != IDLE)) {
+    startupTarePending = false;
+  } else if (startupTarePending && now >= STARTUP_TARE_DELAY_MS) {
+    startupTarePending = false;
+    status(F("# Startup tare: keep the platform empty."));
+    beginCapture(TARE);
   }
 
   // Never call read_average()/tare() here: they wait indefinitely on a missing sensor.
@@ -221,7 +334,8 @@ void loop() {
     if (!sensorTimedOut && now - lastReading >= SENSOR_TIMEOUT_MS) {
       sensorTimedOut = true;
       resetSamples();
-      status(F("# ERROR: HX711 not ready. Waiting for sensor; USB commands still work."));
+      cancelSettling();
+      status(F("# ERROR: HX711 not ready. Waiting for sensor; commands still work."));
     }
     return;
   }
@@ -236,6 +350,7 @@ void loop() {
   // Signed 24-bit limits indicate saturation, not a usable measurement.
   if (raw == 8388607L || raw == -8388608L) {
     resetSamples();
+    cancelSettling();
     if (!sensorSaturated) {
       sensorSaturated = true;
       status(F("# ERROR: HX711 saturated; weight readings paused."));
@@ -264,12 +379,7 @@ void loop() {
   }
   const long average = sampleSum / WEIGHT_SAMPLES;
   resetSamples();
-  if (calibrated && hasTare && now - lastWeightSent >= 500) {
-    const float grams = (float)(average - zeroOffset) / countsPerGram;
-    Serial.print(F("weight_g,"));
-    Serial.println(grams, 2);
-    bluetooth.print(F("weight_g,"));
-    bluetooth.println(grams, 2);
-    lastWeightSent = now;
+  if (calibrated && hasTare) {
+    processWeight((float)(average - zeroOffset) / countsPerGram);
   }
 }

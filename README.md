@@ -16,27 +16,41 @@ You need Arduino IDE, a USB data cable, the wired scale, and a known **100 g wei
 
 1. Open **Tools > Serial Monitor**.
 2. Set **9600 baud** and **Newline**.
-3. Wait for the startup messages. Empty the weighing platform and let it settle.
-4. Type `tare` in the message box and send it. Wait for **`# Tare complete`**.
+3. Keep the platform empty while the scale starts. It tares itself about one second after power-up. Wait for **`# Tare complete`**. If anything was on the platform, empty it and send `tare`.
+4. Optional: send `tare` again at any time to re-zero the empty platform.
 5. Place your **100 g weight** on the platform and let it settle.
 6. Send `calibrate`. Keep the weight still until **`# Calibration saved`** appears.
-7. Remove the weight and start weighing. Readings are in grams:
+7. Remove the weight and start weighing. The scale sends **one reading per item**, in grams, once the item's weight is stable:
 
 ```text
-weight_g,0.12
+# Item detected; waiting for stable weight...
 weight_g,100.03
+# Platform empty; ready for next item.
 ```
 
 If startup already says **`# Saved calibration loaded`**, use the everyday steps below instead of calibrating again. Tare and calibration each usually take about two seconds. Two decimal places describe the display format, not guaranteed accuracy.
 
 ## 3. Everyday use
 
-1. Connect the Arduino and open **Serial Monitor** at **9600 baud**, with **Newline** selected.
-2. Wait for **`# Saved calibration loaded`**.
-3. Empty the platform, send `tare`, and wait for **`# Tare complete`**.
-4. Put an object on the scale and read its weight.
+1. Power the scale with the platform **empty**. No laptop is needed.
+2. The scale loads its saved calibration and tares itself. Over USB you will see **`# Saved calibration loaded`**, then **`# Tare complete`**.
+3. If something was on the platform at power-up, empty it and send `tare` over USB or Bluetooth.
+4. Put an object on the scale. After about 0.8 seconds of steady readings, the scale sends a single `weight_g` line.
+5. Remove the object. When the platform reads empty, the scale is ready for the next item.
 
-You do **not** need the 100 g weight each time. The calibration factor is saved in EEPROM, but the empty-platform zero is set with `tare` after each reset. Opening Serial Monitor may reset the Uno. Recalibrate if readings drift or the scale's mounting changes.
+Readings are event based: the scale sends nothing while the platform is empty, and one reading per item after it settles. Adding more weight to an item that has already been weighed does not send a new reading. Empty the platform first. Items under **5 g** are not reported. These thresholds are constants at the top of the sketch:
+
+| Constant | Default | Meaning |
+| --- | --- | --- |
+| `LOAD_THRESHOLD_G` | 5 g | Minimum weight that counts as an item. |
+| `EMPTY_THRESHOLD_G` | 2 g | The platform counts as empty below this. |
+| `STABLE_TOLERANCE_G` / `STABLE_TOLERANCE_FRACTION` | 1 g / 0.5% | Maximum spread, whichever is larger, for readings to count as stable. |
+| `STABLE_READINGS` | 4 | Consecutive stable readings, about 0.2 s each, before sending. |
+| `EMPTY_READINGS` | 2 | Consecutive empty readings before the scale re-arms. |
+
+If the zero drifts so the empty platform reads 2 g or more, the scale will not re-arm. Send `tare` again.
+
+You do **not** need the 100 g weight each time. The calibration factor is saved in EEPROM. The empty-platform zero is set by the automatic tare at each startup. Opening Serial Monitor may reset the Uno. Recalibrate if readings drift or the scale's mounting changes.
 
 | Command | What it does |
 | --- | --- |
@@ -44,7 +58,7 @@ You do **not** need the 100 g weight each time. The calibration factor is saved 
 | `calibrate` or `c` | Calibrate with 100 g after taring, and save the result. |
 | `help` or `h` | Show instructions. |
 
-Send commands in lowercase through **USB Serial Monitor**. Bluetooth receives readings and status messages; this sketch does not accept Bluetooth commands.
+Send commands in lowercase, ending with a newline, through **USB Serial Monitor** or a **Bluetooth** connection. Replies and readings go to both. A Bluetooth command can occasionally arrive garbled, because HX711 reads briefly block the Bluetooth receiver. The scale then replies `# ERROR: unknown command`; send the command again.
 
 ## 4. Connect over Bluetooth
 
@@ -53,11 +67,11 @@ These steps are for an **HC-05 Bluetooth Classic module**. The receiving app mus
 ### Pair and connect
 
 1. Power the Arduino and module. USB can stay connected, and Arduino Serial Monitor can remain open while Bluetooth sends readings.
-2. Use Serial Monitor to calibrate if necessary, then tare the empty platform as described above. Keep USB connected if you need to send another `tare` command.
+2. Calibrate over USB once if necessary. After that, the scale tares itself at power-up, and `tare` can also be sent over Bluetooth.
 3. On the receiving device, turn on Bluetooth and scan for nearby devices. The module is commonly named **HC-05**, though its configured name can differ.
 4. Pair with the module. If asked for a PIN, use its configured PIN; common factory values are **1234** or **0000**, depending on the module/firmware.
 5. Open an app that supports **Bluetooth Classic serial**, select the paired module, and connect. Pairing alone does not open the data connection. On Android, allow the app's requested **Nearby devices** permissions.
-6. The app should receive `weight_g,...` lines as you weigh objects. Disconnect another Bluetooth client first if the module is already connected elsewhere.
+6. The app should receive one `weight_g,...` line each time an object is placed and settles. Disconnect another Bluetooth client first if the module is already connected elsewhere.
 
 An Android phone with a Classic serial app is a useful first connection test. The **Samsung Watch8 Classic app must implement the Classic serial connection**; direct watch connectivity still needs testing with the actual app and module. Viewing USB output on a Mac requires only Arduino IDE.
 
@@ -72,10 +86,12 @@ Connect as an RFCOMM client to the HC-05's standard SPP UUID:
 ```
 
 - Receive ASCII records separated by **CRLF** (`\r\n`).
-- Parse `weight_g,123.45` as a signed decimal weight in grams, at most twice per second.
+- Parse `weight_g,123.45` as a decimal weight in grams. Each line is a single event: one stable weight for one item placed on an empty platform. No lines are sent while the platform is empty or while an item is settling.
+- `# Item detected; waiting for stable weight...` means a reading is coming. `# Platform empty; ready for next item.` means the previous item was removed.
 - Lines beginning with `#` contain status or errors. They can appear between readings.
+- Send `tare\n` to re-zero the empty platform. `# Tare complete` confirms it. If you get `# ERROR: unknown command`, the bytes were garbled, so resend.
 - Buffer bytes until a newline. A Bluetooth read may contain part of a line or several lines.
-- Show unavailable/stale data after an error, disconnection, or missing fresh measurements instead of presenting the last reading as current.
+- Silence is normal between items. Do not treat it as a stale connection. After an error or disconnection, show the reading as unavailable. Clear it when the platform-empty status arrives.
 
 See Android's [Classic connection guide](https://developer.android.com/develop/connectivity/bluetooth/connect-bluetooth-devices) and [Bluetooth permissions guide](https://developer.android.com/develop/connectivity/bluetooth/bt-permissions). HC-05 pairing examples are described in this [module connection guide](https://www.martyncurrey.com/arduino-with-hc-05-bluetooth-module-in-slave-mode/).
 
@@ -101,7 +117,7 @@ This is the sketch's signal pinout. Follow the wiring and voltage requirements f
 | Calibration was not saved | The current session can still weigh. Keep or replace the 100 g weight and retry `calibrate`. |
 | HX711 error / no readings | Readings pause while the sensor is unavailable or saturated. Resolve the error, then retry any failed tare/calibration. |
 | Bluetooth module is not listed | Use a Classic-capable receiver, check module power/data mode, and disconnect existing clients. A BLE-only scan will not find an HC-05. |
-| Paired, but no Bluetooth readings | Connect within the Classic serial app, grant permissions, confirm module UART is 9600, and complete USB calibration/tare. |
+| Paired, but no Bluetooth readings | Connect within the Classic serial app, grant permissions, confirm module UART is 9600, complete the one-time USB calibration, and make sure the platform was empty at power-up. |
 
 An interrupted EEPROM save can require calibration again. Saved data is checked at startup; EEPROM is written only after successful calibration, and unchanged values are not rewritten.
 
